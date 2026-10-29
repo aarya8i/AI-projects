@@ -57,3 +57,34 @@
 - The skipped esbuild install script turned out not to matter: esbuild 0.27.0 transforms TypeScript fine.
 - **Not yet verified against the real services.** `npx vercel dev` needs a Vercel login and a real API key, so that end-to-end check is for Aarya to run.
 - Server-side refusal fallbacks (`fallbacks: "default"`) were deliberately left out. For Sonnet 5.5 they only retry `cyber` / `frontier_llm` declines, which a trip planner shouldn't trigger. They also require the beta endpoint and would fail if `ANTHROPIC_MODEL` were set to a model that doesn't support them.
+
+## 2026-10-28 · Provider switch: Anthropic → Cerebras
+
+**Asked for:** Replace the Anthropic call in `api/plan.ts` with Cerebras (official TypeScript SDK, model `qwen-3.8-27b`), keeping the response shape, zod validation, 502 behavior and error codes. **Why: cost.** Cerebras offers free API access. Aarya had already confirmed a real request worked with their own key.
+
+**Key finding (from Aarya's own test):** `qwen-3.8-27b` is a reasoning model, and reasoning tokens count toward `max_completion_tokens`. With `max_completion_tokens: 20`, every token went to `reasoning`, `finish_reason` was `"length"`, and `content` was empty. So:
+- The budget is now **4096** tokens, enough for reasoning plus the roughly 600–900-token JSON answer.
+- `reasoning_effort: "low"` (Qwen defaults to `high`). It is lowered but not `none`, so the model still weighs the forecast.
+- The handler reads **only** `message.content`, never `reasoning`. `finish_reason: "length"`, `"content_filter"`, or empty content returns a 502 with a clear message.
+
+**Built:**
+- Swapped `@anthropic-ai/sdk` for `@cerebras/cerebras_cloud_sdk` 1.91.0. Key from `CEREBRAS_API_KEY`, model from `CEREBRAS_MODEL` (default `qwen-3.8-27b`). Both are read only in `api/`.
+- Structured output: `response_format: { type: "json_schema", json_schema: { name: "trip_plan", strict: true, schema } }`. Cerebras's docs say strict mode rejects `minItems`/`maxItems`/`minLength`/`maxLength` and requires `additionalProperties: false` on every object. New `toStrictJsonSchema()` derives the schema from the zod schema (`z.toJSONSchema`) and strips those keywords. zod still enforces exactly 3 risks and non-blank strings after parsing.
+- The SDK's `create()` returns a union type (full response, stream chunk, or error chunk), so the handler checks `object === "chat.completion"` before reading `choices`.
+- Renamed `validateClaudeResponse.ts` → `validateModelResponse.ts` (`modelPlanSchema`, `parseModelResponse`, `ModelPlan`), with logic unchanged, so the code no longer names a provider. Removed the Claude-specific effort setting and refusal handling.
+- `.env.example` and `CLAUDE.md` now describe Cerebras. There's no README yet (Milestone 5), so it will be written for Cerebras.
+
+**Tests:** 64 passing (7 files), typecheck exit 0, Cerebras SDK and `fetch` mocked. New cases:
+- `finish_reason: "length"` with null content → 502
+- answer cut off mid-JSON → 502
+- empty content while a valid plan sits in `reasoning` → 502, proving we never read `reasoning`
+- request params: model, 4096 budget, `reasoning_effort: "low"`, strict schema
+- three unit tests for `toStrictJsonSchema`
+
+Mutation checks:
+- Making the handler fall back to `reasoning` failed exactly the reasoning test.
+- Removing the `length` check failed exactly the budget test.
+
+The "cut off mid-JSON" test still passes without the `length` check, because the invalid JSON alone produces a 502. That's acceptable, but it's the reason the dedicated null-content test exists.
+
+**Not yet verified:** a real end-to-end request through `vercel dev`. 4096 tokens at `low` effort is an estimate; if real runs return "cut off" 502s, raise `MAX_COMPLETION_TOKENS` in `api/plan.ts`.

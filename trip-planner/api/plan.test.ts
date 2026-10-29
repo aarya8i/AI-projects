@@ -1,16 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-// Mock the Anthropic SDK: `create` is the only method the handler uses.
+// Mock the Cerebras SDK: `chat.completions.create` is the only method the handler uses.
 const { create } = vi.hoisted(() => ({ create: vi.fn() }))
-vi.mock('@anthropic-ai/sdk', () => {
+vi.mock('@cerebras/cerebras_cloud_sdk', () => {
   class APIError extends Error {
     status = 500
   }
-  class Anthropic {
+  class Cerebras {
     static APIError = APIError
-    messages = { create }
+    chat = { completions: { create } }
   }
-  return { default: Anthropic }
+  return { default: Cerebras }
 })
 
 import { POST } from './plan.js'
@@ -44,7 +44,7 @@ const forecast = {
 }
 
 const risk = { title: 'Cold rain', detail: '0.35 in of rain at 33-48°F on Oct 30.', mitigation: 'Pack insulated layers.' }
-const claudePlan = {
+const modelPlan = {
   verdict: 'Caution',
   reason: 'Rain and near-freezing lows on Oct 30 call for extra layers.',
   additionalGear: [
@@ -54,8 +54,12 @@ const claudePlan = {
   risks: [risk, risk, risk],
 }
 
-function claudeReply(text: string, stop_reason = 'end_turn') {
-  return { stop_reason, content: [{ type: 'text', text }] }
+/** Shape of a non-streaming Cerebras chat completion. */
+function modelReply(content: string | null, finish_reason = 'stop', reasoning = 'Weighing the forecast...') {
+  return {
+    object: 'chat.completion',
+    choices: [{ index: 0, finish_reason, message: { role: 'assistant', content, reasoning } }],
+  }
 }
 
 /** Routes mocked fetch calls by host. Pass `null` to make that service fail with HTTP 500. */
@@ -82,8 +86,8 @@ function post(body: unknown) {
 beforeEach(() => {
   // Fake only Date so AbortSignal.timeout keeps real timers. Oct 28, 11 AM in Washington.
   vi.useFakeTimers({ now: new Date('2026-10-28T18:00:00Z'), toFake: ['Date'] })
-  vi.stubEnv('ANTHROPIC_API_KEY', 'test-key')
-  vi.stubEnv('ANTHROPIC_MODEL', '')
+  vi.stubEnv('CEREBRAS_API_KEY', 'test-key')
+  vi.stubEnv('CEREBRAS_MODEL', '')
   vi.spyOn(console, 'error').mockImplementation(() => {})
 })
 
@@ -98,7 +102,7 @@ afterEach(() => {
 describe('POST /api/plan', () => {
   it('returns a plan for a valid trip', async () => {
     const fetchMock = mockFetch(geocodeHit)
-    create.mockResolvedValue(claudeReply(JSON.stringify(claudePlan)))
+    create.mockResolvedValue(modelReply(JSON.stringify(modelPlan)))
 
     const res = await post(trip)
     expect(res.status).toBe(200)
@@ -122,20 +126,23 @@ describe('POST /api/plan', () => {
       end_date: '2026-10-31',
     })
 
-    // Default model and token limit; the prompt includes the resolved place.
+    // Default model, token budget, low reasoning, strict JSON schema; the prompt includes the resolved place.
     const params = create.mock.calls[0][0]
-    expect(params.model).toBe('claude-sonnet-5-5')
-    expect(params.max_tokens).toBe(1500)
-    expect(params.messages[0].content).toContain('Mount Rainier, Washington, United States')
+    expect(params.model).toBe('qwen-3.8-27b')
+    expect(params.max_completion_tokens).toBe(4096)
+    expect(params.reasoning_effort).toBe('low')
+    expect(params.response_format).toMatchObject({ type: 'json_schema', json_schema: { name: 'trip_plan', strict: true } })
+    expect(params.messages[0].role).toBe('system')
+    expect(params.messages[1].content).toContain('Mount Rainier, Washington, United States')
   })
 
-  it('uses ANTHROPIC_MODEL when set', async () => {
-    vi.stubEnv('ANTHROPIC_MODEL', 'claude-haiku-5-5')
+  it('uses CEREBRAS_MODEL when set', async () => {
+    vi.stubEnv('CEREBRAS_MODEL', 'gpt-oss-120b')
     mockFetch(geocodeHit)
-    create.mockResolvedValue(claudeReply(JSON.stringify(claudePlan)))
+    create.mockResolvedValue(modelReply(JSON.stringify(modelPlan)))
 
     await post(trip)
-    expect(create.mock.calls[0][0].model).toBe('claude-haiku-5-5')
+    expect(create.mock.calls[0][0].model).toBe('gpt-oss-120b')
   })
 
   it('returns 404 when the location is not found', async () => {
@@ -147,9 +154,9 @@ describe('POST /api/plan', () => {
     expect(create).not.toHaveBeenCalled()
   })
 
-  it('returns 502 when Claude returns output that fails validation', async () => {
+  it('returns 502 when the model returns output that fails validation', async () => {
     mockFetch(geocodeHit)
-    create.mockResolvedValue(claudeReply(JSON.stringify({ ...claudePlan, risks: [risk, risk] })))
+    create.mockResolvedValue(modelReply(JSON.stringify({ ...modelPlan, risks: [risk, risk] })))
 
     const res = await post(trip)
     expect(res.status).toBe(502)
@@ -159,16 +166,33 @@ describe('POST /api/plan', () => {
     })
   })
 
-  it('returns 502 when the Claude response is cut off at max_tokens', async () => {
+  it('returns 502 when reasoning uses up the token budget (finish_reason "length", no content)', async () => {
     mockFetch(geocodeHit)
-    create.mockResolvedValue(claudeReply('{"verdict": "Go", "rea', 'max_tokens'))
+    create.mockResolvedValue(modelReply(null, 'length', 'Let me think about the rain on Oct 30...'))
 
     const res = await post(trip)
     expect(res.status).toBe(502)
-    expect((await res.json()).error).toContain('cut off')
+    expect(await res.json()).toEqual({ code: 'upstream_error', error: 'The AI response was cut off. Please try again.' })
   })
 
-  it('returns 502 when the Anthropic API throws', async () => {
+  it('returns 502 when the answer is cut off mid-JSON', async () => {
+    mockFetch(geocodeHit)
+    create.mockResolvedValue(modelReply('{"verdict": "Go", "rea', 'length'))
+
+    expect((await post(trip)).status).toBe(502)
+  })
+
+  it('returns 502 for empty content and never falls back to the reasoning field', async () => {
+    mockFetch(geocodeHit)
+    // A valid plan sits in `reasoning`, but only `content` is the answer.
+    create.mockResolvedValue(modelReply('   ', 'stop', JSON.stringify(modelPlan)))
+
+    const res = await post(trip)
+    expect(res.status).toBe(502)
+    expect(await res.json()).toEqual({ code: 'upstream_error', error: 'The AI returned an empty response. Please try again.' })
+  })
+
+  it('returns 502 when the Cerebras API throws', async () => {
     mockFetch(geocodeHit)
     create.mockRejectedValue(new Error('network down'))
 
@@ -210,14 +234,14 @@ describe('POST /api/plan', () => {
     // 03:00 UTC on Oct 29 is still Oct 28 in Washington, so an Oct 28 start is allowed.
     vi.setSystemTime(new Date('2026-10-29T03:00:00Z'))
     mockFetch(geocodeHit, { daily: { ...forecast.daily, time: ['2026-10-28'] } })
-    create.mockResolvedValue(claudeReply(JSON.stringify(claudePlan)))
+    create.mockResolvedValue(modelReply(JSON.stringify(modelPlan)))
 
     const res = await post({ ...trip, startDate: '2026-10-28', endDate: '2026-10-28' })
     expect(res.status).toBe(200)
   })
 
   it('returns 500 without calling services when the API key is missing', async () => {
-    vi.stubEnv('ANTHROPIC_API_KEY', '')
+    vi.stubEnv('CEREBRAS_API_KEY', '')
     const fetchMock = mockFetch(geocodeHit)
 
     const res = await post(trip)

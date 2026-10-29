@@ -1,19 +1,20 @@
 // POST /api/plan: the only endpoint the browser calls.
 // Flow: validate → geocode → date check in the place's time zone → forecast → summarize
-//       → Claude → validate model output → merge checklist → respond.
-import Anthropic from '@anthropic-ai/sdk'
-import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod'
+//       → Cerebras model → validate model output → merge checklist → respond.
+import Cerebras from '@cerebras/cerebras_cloud_sdk'
 import { z } from 'zod'
 import { mergeChecklist } from '../src/lib/checklist.js'
 import { todayInTimeZone } from '../src/lib/dates.js'
 import { buildUserPrompt, SYSTEM_PROMPT } from '../src/lib/prompt.js'
 import { DAILY_VARIABLES, summarizeForecast, type OpenMeteoDaily } from '../src/lib/summarizeForecast.js'
 import type { ErrorCode, ErrorResponse, PlanResponse } from '../src/lib/types.js'
-import { claudePlanSchema, parseClaudeResponse } from '../src/lib/validateClaudeResponse.js'
 import { checkDates, validateTripInput } from '../src/lib/validateInput.js'
+import { parseModelResponse, toStrictJsonSchema } from '../src/lib/validateModelResponse.js'
 
-const DEFAULT_MODEL = 'claude-sonnet-5-5'
-const MAX_TOKENS = 1500
+const DEFAULT_MODEL = 'qwen-3.8-27b'
+// Reasoning tokens count toward this limit, so it must cover reasoning plus the ~600-900 token JSON answer.
+const MAX_COMPLETION_TOKENS = 4096
+const REASONING_EFFORT = 'low'
 const FETCH_TIMEOUT_MS = 10_000
 
 const geocodeSchema = z.object({
@@ -66,9 +67,9 @@ export async function POST(req: Request): Promise<Response> {
   const trip = input.data
 
   // Read only here, on the server. Never log it.
-  const apiKey = process.env.ANTHROPIC_API_KEY
+  const apiKey = process.env.CEREBRAS_API_KEY
   if (!apiKey) {
-    console.error('ANTHROPIC_API_KEY is not set')
+    console.error('CEREBRAS_API_KEY is not set')
     return fail(500, 'server_error', 'The server is not configured correctly. Please try again later.')
   }
 
@@ -124,37 +125,52 @@ export async function POST(req: Request): Promise<Response> {
     return fail(502, 'upstream_error', 'The weather service returned no forecast for those dates.')
   }
 
-  // 4. Ask Claude. Structured outputs constrain the JSON shape; zod still has the final say.
+  // 4. Ask the model. Strict JSON schema output constrains the shape; zod still has the final say.
   let text: string
   try {
-    const client = new Anthropic({ apiKey, timeout: 60_000, maxRetries: 1 })
-    const message = await client.messages.create({
-      model: process.env.ANTHROPIC_MODEL || DEFAULT_MODEL,
-      max_tokens: MAX_TOKENS,
-      // Low effort keeps thinking short, leaving the token budget for the JSON answer.
-      output_config: { effort: 'low', format: zodOutputFormat(claudePlanSchema) },
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: buildUserPrompt(trip, resolvedPlace, summary) }],
+    const client = new Cerebras({ apiKey, timeout: 60_000, maxRetries: 1 })
+    const completion = await client.chat.completions.create({
+      model: process.env.CEREBRAS_MODEL || DEFAULT_MODEL,
+      max_completion_tokens: MAX_COMPLETION_TOKENS,
+      reasoning_effort: REASONING_EFFORT,
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name: 'trip_plan', strict: true, schema: toStrictJsonSchema() },
+      },
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: buildUserPrompt(trip, resolvedPlace, summary) },
+      ],
     })
-    if (message.stop_reason === 'refusal') {
-      return fail(502, 'upstream_error', 'The AI declined to assess this trip. Please check official conditions instead.')
+    if (!('object' in completion) || completion.object !== 'chat.completion') {
+      throw new Error('Unexpected response type from Cerebras')
     }
-    if (message.stop_reason === 'max_tokens') {
-      console.error('Claude response hit max_tokens')
+    const choice = completion.choices[0]
+    if (choice?.finish_reason === 'length') {
+      // Reasoning tokens used up the budget before (or during) the answer.
+      console.error('Model response hit max_completion_tokens')
       return fail(502, 'upstream_error', 'The AI response was cut off. Please try again.')
     }
-    text = message.content.flatMap((block) => (block.type === 'text' ? [block.text] : [])).join('')
+    if (choice?.finish_reason === 'content_filter') {
+      return fail(502, 'upstream_error', 'The AI declined to assess this trip. Please check official conditions instead.')
+    }
+    // Only the final answer. The separate `reasoning` field is never read.
+    text = choice?.message.content?.trim() ?? ''
+    if (!text) {
+      console.error('Model returned empty content')
+      return fail(502, 'upstream_error', 'The AI returned an empty response. Please try again.')
+    }
   } catch (err) {
-    if (err instanceof Anthropic.APIError) {
-      console.error(`Anthropic API error ${err.status}:`, err.message)
+    if (err instanceof Cerebras.APIError) {
+      console.error(`Cerebras API error ${err.status}:`, err.message)
     } else {
-      console.error('Anthropic request failed:', err instanceof Error ? err.message : err)
+      console.error('Cerebras request failed:', err instanceof Error ? err.message : err)
     }
     return fail(502, 'upstream_error', 'The AI service is unavailable right now. Please try again.')
   }
 
   // 5. Validate the model output before trusting it.
-  const plan = parseClaudeResponse(text)
+  const plan = parseModelResponse(text)
   if (!plan.ok) {
     console.error('Invalid model output:', plan.error)
     return fail(502, 'upstream_error', 'The AI returned an unexpected response. Please try again.')

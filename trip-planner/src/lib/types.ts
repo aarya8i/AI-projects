@@ -30,8 +30,8 @@ export interface Risk {
   mitigation: string
 }
 
-/** The JSON shape Claude must return. */
-export interface ClaudePlan {
+/** The JSON shape the model must return. */
+export interface ModelPlan {
   verdict: Verdict
   reason: string
   additionalGear: GearSuggestion[]
