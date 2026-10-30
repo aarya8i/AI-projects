@@ -112,7 +112,16 @@ This app lives in a subfolder of the `AI-projects` repo.
 - **Duplicate detection in the checklist is simple.** It ignores case, punctuation and plurals, but not synonyms ("rain jacket" and "rain gear" both appear).
 - **The free Cerebras tier has rate limits.** Heavy use may return "service is having trouble" errors.
 - The UI components have no automated tests. The logic they rely on (`src/lib/`) and the API handler do.
+- Location search covers towns and cities better than trails and landmarks (for example, "Fern Canyon" isn't found). Searching for a nearby town works better.
 
 ## How I used AI
 
-TODO
+I built this with Claude Code (Opus 5.5) in my terminal, and used Claude in a separate chat as a guide for setup, errors, and reviewing plans. Claude Code wrote most of the code. My job was to define the spec, review each plan before approving it, verify every milestone myself, and make the decisions.
+
+- **Rules and milestones.** I wrote a CLAUDE.md with standing rules (key only on the server, run tests and typecheck before calling anything done, log every step in BUILD_LOG.md) and split the build into five milestones with a stop after each so I could check the work.
+- **Testing the tests.** To confirm the timezone test actually caught bugs, Claude Code deliberately broke the date logic, confirmed exactly that test failed, then reverted it.
+- **Switching providers.** I started with the Claude API, then switched the app's model call to Cerebras for cost. Before rewriting anything, I sent one raw test request and found the model spent all 20 tokens "reasoning" and returned no answer. That led to lower reasoning effort, a larger token budget, and a clear error when a response is cut off.
+- **Bugs found by testing.** A real request for "Mount Rainier" resolved to a town in Maryland, because the app uses the first geocoding match. I documented it as a known limitation and made the UI show the resolved place prominently. I also found that `vercel dev` wasn't loading my key from `.env.local`, and fixed it with Vercel's environment variables.
+- **Security.** I accidentally exposed an API key in a screenshot, so I created a new key for production and revoked the old one.
+
+**What I'd do next:** let users choose between matching locations, add tests for the React components, and add rate limiting to the API.
