@@ -88,3 +88,30 @@ Mutation checks:
 The "cut off mid-JSON" test still passes without the `length` check, because the invalid JSON alone produces a 502. That's acceptable, but it's the reason the dedicated null-content test exists.
 
 **Not yet verified:** a real end-to-end request through `vercel dev`. 4096 tokens at `low` effort is an estimate; if real runs return "cut off" 502s, raise `MAX_COMPLETION_TOKENS` in `api/plan.ts`.
+
+## 2026-10-28 · Findings from Aarya's `vercel dev` test
+
+1. **Wrong place from geocoding.** "Mount Rainier" resolved to **Mount Rainier, Maryland**, not the Washington volcano, because the API uses Open-Meteo's first geocoding match. Not changed in code for v1 (no place picker, to stay in scope). Instead, the results page now shows "Forecast for: <place>" prominently with a hint to use a more specific name, and the README lists it under Known limitations.
+2. **`vercel dev` did not load `CEREBRAS_API_KEY` from `.env.local`.** Aarya fixed it by adding the key as a Vercel Development environment variable with `vercel env add`. The README's local setup now uses that step and mentions the `.env.local` behavior.
+
+## 2026-10-29 · Milestones 4 + 5: UI and README
+
+**Asked for:** A simple, clean single-page UI (form, results, per-code error banner, loading state, disclaimer, mobile-friendly, plain CSS), with "Forecast for: <resolvedPlace>" prominent at the top of the results plus a wrong-place hint. Then a README written for Cerebras with a Known limitations section and a TODO "How I used AI" section. Both done in one go, without stopping in between.
+
+**Built:**
+- `src/lib/api.ts`: `requestPlan()` POSTs to `/api/plan` and never throws. `friendlyError()` maps each error code (`invalid_input`, `dates_out_of_range`, `location_not_found`, `upstream_error`, `server_error`) to a banner title and keeps the server's detail; network failures and non-JSON responses get their own messages. 5 unit tests with mocked fetch.
+- `src/components/TripForm.tsx`:
+  - Native date pickers limited to today through today+15 (the browser's date; the server re-checks against the location's date).
+  - Activity and experience dropdowns, and a group-size input.
+  - Client-side validation reuses `validateTripInput` from `src/lib`, so bad input never reaches the server.
+- `src/components/Results.tsx`: "Forecast for" card with the hint, a verdict card colored by Go/Caution/Reconsider, 3 risk cards, and a checklist with checkboxes (essentials tagged "Ten Essentials", extras show their "why").
+- `src/components/ErrorBanner.tsx` (`role="alert"`), loading text plus a disabled button, results inside an `aria-live` region, and a disclaimer footer.
+- `src/index.css`: plain CSS; a two-column form that collapses to one column under 540px.
+- Removed the Vite demo files (`App.css`, `src/assets/*`, `public/icons.svg`), replaced the favicon, and set the page title.
+- `README.md`: overview, architecture, structure, setup, env var table, `vercel dev` steps, tests, Vercel deploy (Root Directory `trip-planner`), Known limitations, "How I used AI: TODO".
+
+**Verified:** `npm test` → 69 passed (8 files). `npm run typecheck` → exit 0. `npm run lint` → clean. `npm run build` → succeeds.
+
+**Not verified by me:** how the UI looks and behaves in a real browser against the live API. That's for Aarya to check with `vercel dev`. The React components have no automated tests (only `src/lib` and the handler do).
+
+**Note:** the client bundle is about 310 kB (95 kB gzipped), mostly zod, because the form reuses the shared validation. That's acceptable for v1.
